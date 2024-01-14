@@ -1,0 +1,5 @@
+.idea/
+cmake-build-release/
+test_env*
+cmake-build-debug/
+main
