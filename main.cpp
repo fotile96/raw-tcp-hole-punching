@@ -21,11 +21,14 @@
 
 #include "in_cksum.h"
 
-std::string read_env(const char *env_name) {
+inline std::string read_env(const char *env_name, bool allow_omit = false) {
     auto res = std::getenv(env_name);
     if (res == nullptr) {
         std::cerr << "Unspecified environment variable: " << env_name << std::endl;
-        std::exit(EINVAL);
+        if (!allow_omit)
+            std::exit(EINVAL);
+        else
+            return "";
     }
     return std::string(res);
 }
@@ -48,7 +51,7 @@ std::string udp_forward_port;
 int udp_sockfd;
 int raw_sockfd;
 sockaddr_in raw_sin;
-sockaddr_in udp_sin;
+sockaddr_in *udp_sin;
 char raw_ip_packet[4096];
 iphdr *const iph = reinterpret_cast<iphdr *>(raw_ip_packet);
 tcphdr *const tcph = reinterpret_cast<tcphdr *>(raw_ip_packet + sizeof(iphdr));
@@ -101,8 +104,10 @@ void pcap_get_packet(u_char *arg, const struct pcap_pkthdr *pkthdr, const u_char
         return;
 
 
-    int sent = sendto(udp_sockfd, tcp_payload, payload_len, 0, reinterpret_cast<const sockaddr *>(&udp_sin),
-                      sizeof(udp_sin));
+    int sent = 0;
+    if (udp_sin != nullptr)
+        sent = sendto(udp_sockfd, tcp_payload, payload_len, 0, reinterpret_cast<const sockaddr *>(udp_sin),
+                      sizeof(sockaddr_in));
 
 #ifndef NDEBUG
     std::cerr << "sent = " << sent << std::endl;
@@ -114,12 +119,30 @@ void pcap_get_packet(u_char *arg, const struct pcap_pkthdr *pkthdr, const u_char
 
 void pcap_thread_main() {
     char errBuf[PCAP_ERRBUF_SIZE];
-    pcap_t *device = pcap_open_live(raw_listen_dev.c_str(), 65535, 1, 50, errBuf);
+    //pcap_t *device = pcap_open_live(raw_listen_dev.c_str(), 65535, 1, 1, errBuf);
+    pcap_t *device = pcap_create(raw_listen_dev.c_str(), errBuf);
 
     if (device == nullptr) {
-        std::cerr << "error: pcap_open_live(): " << errBuf << std::endl;
+        std::cerr << "error: pcap_create(): " << errBuf << std::endl;
         std::exit(EPERM);
     }
+
+    if (pcap_set_snaplen(device, 65535) != 0) {
+        std::cerr << "error: pcap_set_snaplen() failed" << std::endl;
+        std::exit(EPERM);
+    }
+
+    if (pcap_set_immediate_mode(device, 1) != 0) {
+        std::cerr << "error: pcap_set_immediate_mode() failed" << std::endl;
+        std::exit(EPERM);
+    }
+
+    if (pcap_activate(device) != 0) {
+        std::cerr << "error: pcap_activate() failed" << std::endl;
+        std::exit(EPERM);
+    }
+
+    pcap_set_buffer_size(device, 32 * 1024 * 1024);
 
     absl::Cleanup device_closer = [device] {
         pcap_close(device);
@@ -162,7 +185,16 @@ void pcap_thread_main() {
 
 void udp_thread_main() {
     while (true) {
-        int recv_len = recvfrom(udp_sockfd, raw_payload, 3072, 0, NULL, NULL);
+        int recv_len = 0;
+        if (udp_sin != nullptr)
+            recv_len = recvfrom(udp_sockfd, raw_payload, 3072, 0, NULL, NULL);
+        else {
+            auto *sin = new sockaddr_in;
+            socklen_t sin_len = sizeof(sockaddr_in);
+            std::memset(sin, 0, sin_len);
+            recv_len = recvfrom(udp_sockfd, raw_payload, 3072, 0, reinterpret_cast<sockaddr *>(sin), &sin_len);
+            udp_sin = sin;
+        }
         if (recv_len <= 0)
             continue;
 #ifndef NDEBUG
@@ -188,6 +220,20 @@ inline void parse_addr_to_str(const std::string &addr, std::string &host, std::s
     port = addr.substr(n + 1);
 }
 
+void open_udp_sin() {
+    if (!(udp_forward_addr.length() > 0 && udp_sin == nullptr))
+        return;
+    parse_addr_to_str(udp_forward_addr, udp_forward_host, udp_forward_port);
+
+    auto _udp_sin = new sockaddr_in;
+    std::memset(_udp_sin, 0, sizeof(sockaddr_in));
+    _udp_sin->sin_family = AF_INET;
+    _udp_sin->sin_port = htons(std::stoi(udp_forward_port));
+    _udp_sin->sin_addr.s_addr = inet_addr(udp_forward_host.c_str());
+
+    udp_sin = _udp_sin;
+}
+
 void open_udp_socket() {
     udp_sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     if (udp_sockfd < 0) {
@@ -197,6 +243,12 @@ void open_udp_socket() {
 
     int reuse = 1;
     if (setsockopt(udp_sockfd, SOL_SOCKET, SO_REUSEADDR, (const char *) &reuse, sizeof(reuse)) < 0) {
+        std::cerr << "setsockopt(SO_REUSEADDR) failed." << std::endl;
+        close(udp_sockfd);
+        std::exit(errno);
+    }
+    reuse = 1;
+    if (setsockopt(udp_sockfd, SOL_SOCKET, SO_REUSEPORT, (const char *) &reuse, sizeof(reuse)) < 0) {
         std::cerr << "setsockopt(SO_REUSEADDR) failed." << std::endl;
         close(udp_sockfd);
         std::exit(errno);
@@ -222,10 +274,7 @@ void open_udp_socket() {
     int on = 1;
     setsockopt(udp_sockfd, SOL_SOCKET, SO_BROADCAST, &on, sizeof(on));
 
-    std::memset(&udp_sin, 0, sizeof(sockaddr_in));
-    udp_sin.sin_family = AF_INET;
-    udp_sin.sin_port = htons(std::stoi(udp_forward_port));
-    udp_sin.sin_addr.s_addr = inet_addr(udp_forward_host.c_str());
+    open_udp_sin();
 }
 
 void open_raw_socket() {
@@ -242,7 +291,7 @@ void open_raw_socket() {
     sin.sin_port = htons(std::stoi(tcp_local_port));
     sin.sin_addr.s_addr = inet_addr(tcp_local_host.c_str());
 
-    if (bind(raw_sockfd, reinterpret_cast<const sockaddr*>(&sin), sizeof(sin)) != 0) {
+    if (bind(raw_sockfd, reinterpret_cast<const sockaddr *>(&sin), sizeof(sin)) != 0) {
         std::cerr << "Failed to bind the raw socket to specified address!" << std::endl;
         std::exit(errno);
     }
@@ -357,13 +406,13 @@ int main(int argc, char *argv[]) {
     tcp_opponent_addr = read_env(ENV_TCP_OPPONENT_ADDR);
     tcp_local_addr = read_env(ENV_TCP_LOCAL_ADDR);
     udp_listen_addr = read_env(ENV_UDP_LISTEN_ADDR);
-    udp_forward_addr = read_env(ENV_UDP_FORWARD_ADDR);
+    udp_forward_addr = read_env(ENV_UDP_FORWARD_ADDR, true);
     raw_listen_dev = read_env(ENV_RAW_LISTEN_DEV);
 
     parse_addr_to_str(tcp_opponent_addr, tcp_opponent_host, tcp_opponent_port);
     parse_addr_to_str(tcp_local_addr, tcp_local_host, tcp_local_port);
     parse_addr_to_str(udp_listen_addr, udp_listen_host, udp_listen_port);
-    parse_addr_to_str(udp_forward_addr, udp_forward_host, udp_forward_port);
+
 
     open_udp_socket();
     open_raw_socket();
